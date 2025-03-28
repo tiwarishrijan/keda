@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"strings"
@@ -33,6 +34,13 @@ const (
 	// https://learn.microsoft.com/en-gb/azure/devops/integrate/get-started/authentication/service-principal-managed-identity?view=azure-devops
 	devopsResource = "499b84ac-1321-427f-aa17-267ca6975798/.default"
 )
+
+type OrgLicense struct {
+	UsedCount     int `json:"usedCount"`
+	ResourceLimit struct {
+		TotalCount int `json:"totalCount"`
+	} `json:"resourceLimit"`
+}
 
 type JobRequest struct {
 	RequestID     int       `json:"requestId"`
@@ -412,6 +420,23 @@ func (s *azurePipelinesScaler) GetAzurePipelinesQueueLength(ctx context.Context)
 	return count, err
 }
 
+// GetAzurePipelinesLicenseCount returns the number of used and total licenses
+func (s *azurePipelinesScaler) GetAzurePipelinesLicenseCount(ctx context.Context) (int64, int64, error) {
+	urlString := fmt.Sprintf("%s/_apis/distributedtask/resourceusage?parallelismTag=Private&poolIsHosted=false&includeRunningRequests=true", s.metadata.OrganizationURL)
+	body, err := getAzurePipelineRequest(ctx, s.logger, urlString, s.metadata, s.podIdentity, s.httpClient)
+	if err != nil {
+		return -1, -1, err
+	}
+
+	var orgLicense OrgLicense
+	err = json.Unmarshal(body, &orgLicense)
+	if err != nil {
+		s.logger.Error(err, "Cannot unmarshal ADO License API response")
+		return -1, -1, err
+	}
+
+	return int64(orgLicense.UsedCount), int64(orgLicense.ResourceLimit.TotalCount), nil
+}
 func stripDeadJobs(jobs []JobRequest) []JobRequest {
 	var filtered []JobRequest
 	for _, job := range jobs {
@@ -484,15 +509,22 @@ func (s *azurePipelinesScaler) GetMetricSpecForScaling(context.Context) []v2.Met
 
 func (s *azurePipelinesScaler) GetMetricsAndActivity(ctx context.Context, metricName string) ([]external_metrics.ExternalMetricValue, bool, error) {
 	queueLen, err := s.GetAzurePipelinesQueueLength(ctx)
-
 	if err != nil {
 		s.logger.Error(err, "error getting pipelines queue length")
 		return []external_metrics.ExternalMetricValue{}, false, err
 	}
+	usedCount, totalCount, err := s.GetAzurePipelinesLicenseCount(ctx)
+	if err != nil {
+		s.logger.Error(err, "error getting pipelines license count")
+		return []external_metrics.ExternalMetricValue{}, false, err
+	}
+	s.logger.Info("Azure Pipelines License Count", "UsedCount", usedCount, "TotalCount", totalCount)
+	remainingLicense := totalCount - usedCount
+	s.logger.Info("Azure Pipelines License Difference", "Difference", remainingLicense)
+	maxAgentQueueLength := int64(math.Min(float64(remainingLicense), float64(queueLen)))
 
-	metric := GenerateMetricInMili(metricName, float64(queueLen))
-
-	return []external_metrics.ExternalMetricValue{metric}, queueLen > s.metadata.ActivationTargetPipelinesQueueLength, nil
+	metric := GenerateMetricInMili(metricName, float64(maxAgentQueueLength))
+	return []external_metrics.ExternalMetricValue{metric}, maxAgentQueueLength > s.metadata.ActivationTargetPipelinesQueueLength, nil
 }
 
 func (s *azurePipelinesScaler) Close(context.Context) error {
